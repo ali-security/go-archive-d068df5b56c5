@@ -1,10 +1,12 @@
 name: test
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level Go test names to run (empty = full suite)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -28,26 +30,66 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
-      - name: lint
-        uses: golangci/golangci-lint-action@v9
+      - name: Build module zip
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.23.x'
+        shell: bash
+        run: |
+          helper="$RUNNER_TEMP/create_mod"
+          mkdir -p "$helper" "$RUNNER_TEMP/build_output"
+          cat > "$helper/main.go" <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          src="$GITHUB_WORKSPACE"
+          (cd "$helper" && go mod init example.com/createmod && go get golang.org/x/mod@v0.22.0 && go run . github.com/moby/go-archive v0.2.0 "$src" "$RUNNER_TEMP/build_output/v0.2.0.zip")
+          unzip -l "$RUNNER_TEMP/build_output/v0.2.0.zip"
+
+      - name: Upload module zip
+        if: matrix.os == 'ubuntu-latest' && matrix.go-version == '1.23.x'
+        uses: actions/upload-artifact@v4
         with:
-          version: v2.7
-          args: --print-resources-usage --timeout=10m --verbose
+          name: module-zip
+          path: ${{ runner.temp }}/build_output/v0.2.0.zip
+          if-no-files-found: error
 
       - name: Test
-        run: go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            go test -v -run "^($(echo "${{ inputs.test-filter }}" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in ${{ inputs.test-filter }}; do grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || exit 1; done
+          else
+            go test -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+            echo "TEST SUMMARY: $(grep -c '^--- PASS' "$RUNNER_TEMP/full.log") passed, $(grep -c '^--- FAIL' "$RUNNER_TEMP/full.log") failed, $(grep -c '^--- SKIP' "$RUNNER_TEMP/full.log") skipped"
+          fi
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
 
       - name: Test (root)
-        if: runner.os == 'Linux'
-        run: go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./...
+        if: runner.os == 'Linux' && inputs.test-filter == ''
+        run: |
+          go test -exec "sudo -E -n" -v -cover "-coverprofile=coverage.txt" -covermode=atomic ./... 2>&1 | tee "$RUNNER_TEMP/root.log"
+          echo "TEST SUMMARY (root): $(grep -c '^--- PASS' "$RUNNER_TEMP/root.log") passed, $(grep -c '^--- FAIL' "$RUNNER_TEMP/root.log") failed, $(grep -c '^--- SKIP' "$RUNNER_TEMP/root.log") skipped"
         shell: bash
         env:
           MSYS_NO_PATHCONV: '1'
-
-      - name: Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          directory: ./

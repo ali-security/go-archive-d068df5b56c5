@@ -70,9 +70,23 @@ func handleTarTypeBlockCharFifo(hdr *tar.Header, path string) error {
 	return mknod(path, mode, unix.Mkdev(uint32(hdr.Devmajor), uint32(hdr.Devminor)))
 }
 
-func handleLChmod(hdr *tar.Header, path string, hdrInfo os.FileInfo) error {
+// hardlink creates newname as a hard link to oldname. If oldname is a symlink,
+// the link is created to the symlink itself rather than to its target, on all
+// platforms, so that a symlink cannot redirect the hard link outside of the
+// extraction root.
+func hardlink(oldname, newname string) error {
+	if err := unix.Linkat(unix.AT_FDCWD, oldname, unix.AT_FDCWD, newname, 0); err != nil {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: err}
+	}
+	return nil
+}
+
+// handleLChmod applies the mode from hdrInfo to path, skipping symlinks (there
+// is no lchmod). For hardlinks, the mode is applied only when the (resolved)
+// link target is itself not a symlink.
+func handleLChmod(hdr *tar.Header, path, hardlinkTarget string, hdrInfo os.FileInfo) error {
 	if hdr.Typeflag == tar.TypeLink {
-		if fi, err := os.Lstat(hdr.Linkname); err == nil && (fi.Mode()&os.ModeSymlink == 0) {
+		if fi, err := os.Lstat(hardlinkTarget); err == nil && (fi.Mode()&os.ModeSymlink == 0) {
 			if err := os.Chmod(path, hdrInfo.Mode()); err != nil {
 				return err
 			}
